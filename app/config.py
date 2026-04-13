@@ -1,10 +1,10 @@
-# RAG Demo 配置
+# RAG Demo 配置 - LangChain 版
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# LLM 配置（DeepSeek）
+# LLM 配置
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
@@ -13,12 +13,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
 EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.siliconflow.cn/v1")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
 
-# Milvus 配置
-MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
-MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
-MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "rag_docs")
+# Chroma 配置
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "rag_docs")
 
 # Langfuse 配置
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")

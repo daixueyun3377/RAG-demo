@@ -4,18 +4,17 @@ import os
 from typing import Literal
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.document_loaders import TextLoader, UnstructuredMarkdownLoader, DirectoryLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter, CharacterTextSplitter
+from langchain_community.document_loaders import TextLoader, DirectoryLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter, CharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
-from langchain.chains import RetrievalQA
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 from langchain_core.documents import Document
-from langfuse import Langfuse
-from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+try:
+    from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+except (ImportError, ModuleNotFoundError):
+    LangfuseCallbackHandler = None
 
 from app.config import *
 
@@ -41,7 +40,7 @@ def get_embeddings():
 
 
 def get_langfuse_handler():
-    if LANGFUSE_SECRET_KEY and LANGFUSE_PUBLIC_KEY:
+    if LangfuseCallbackHandler and LANGFUSE_SECRET_KEY and LANGFUSE_PUBLIC_KEY:
         return LangfuseCallbackHandler(
             secret_key=LANGFUSE_SECRET_KEY,
             public_key=LANGFUSE_PUBLIC_KEY,
@@ -171,16 +170,31 @@ def get_bm25_retriever(top_k: int = TOP_K):
     return BM25Retriever.from_documents(_all_docs_for_bm25, k=top_k)
 
 
-def get_hybrid_retriever(top_k: int = TOP_K):
-    """混合检索：向量 + BM25，RRF 融合"""
+def hybrid_retrieve(query: str, top_k: int = TOP_K) -> list[Document]:
+    """混合检索：向量 + BM25，RRF (Reciprocal Rank Fusion) 融合"""
     vector_retriever = get_vector_retriever(top_k)
     bm25_retriever = get_bm25_retriever(top_k)
-    if bm25_retriever is None:
-        return vector_retriever
-    return EnsembleRetriever(
-        retrievers=[vector_retriever, bm25_retriever],
-        weights=[0.6, 0.4],  # 向量权重 60%，BM25 权重 40%
-    )
+
+    vector_docs = vector_retriever.invoke(query)
+    bm25_docs = bm25_retriever.invoke(query) if bm25_retriever else []
+
+    # RRF 融合：score = w * 1/(k+rank)，k=60 是常用常数
+    rrf_k = 60
+    scores: dict[str, float] = {}
+    doc_map: dict[str, Document] = {}
+
+    for rank, doc in enumerate(vector_docs):
+        key = doc.page_content[:200]
+        scores[key] = scores.get(key, 0) + 0.6 * (1.0 / (rrf_k + rank))
+        doc_map[key] = doc
+
+    for rank, doc in enumerate(bm25_docs):
+        key = doc.page_content[:200]
+        scores[key] = scores.get(key, 0) + 0.4 * (1.0 / (rrf_k + rank))
+        doc_map[key] = doc
+
+    sorted_keys = sorted(scores, key=scores.get, reverse=True)[:top_k]
+    return [doc_map[k] for k in sorted_keys]
 
 
 # ========== Query 改写 / HyDE ==========
@@ -255,18 +269,16 @@ def query_rag(
         search_query = hyde_query(question)
         transform_info = f"hyde → {search_query[:100]}..."
 
-    # 2. 选择检索器
+    # 2. 检索
     if retrieval_mode == "vector":
-        retriever = get_vector_retriever(top_k)
+        retrieved_docs = get_vector_retriever(top_k).invoke(search_query)
     elif retrieval_mode == "bm25":
         retriever = get_bm25_retriever(top_k)
         if retriever is None:
             return {"answer": "知识库为空，请先上传文档", "sources": [], "config": {}}
+        retrieved_docs = retriever.invoke(search_query)
     else:
-        retriever = get_hybrid_retriever(top_k)
-
-    # 3. 检索
-    retrieved_docs = retriever.invoke(search_query)
+        retrieved_docs = hybrid_retrieve(search_query, top_k)
 
     # 4. 生成回答（LCEL chain）
     llm = get_llm()

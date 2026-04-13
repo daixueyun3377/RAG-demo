@@ -1,6 +1,8 @@
 # RAG 核心引擎 - LangChain 版
 # 覆盖：DocumentLoader, TextSplitter(多策略), Chroma, BM25混合检索, Reranker, RetrievalQA
 import os
+import logging
+import hashlib
 import requests
 from typing import Literal
 
@@ -193,12 +195,12 @@ def hybrid_retrieve(query: str, top_k: int = TOP_K) -> list[Document]:
     doc_map: dict[str, Document] = {}
 
     for rank, doc in enumerate(vector_docs):
-        key = doc.page_content[:200]
+        key = hashlib.md5(doc.page_content.encode()).hexdigest()
         scores[key] = scores.get(key, 0) + 0.6 * (1.0 / (rrf_k + rank))
         doc_map[key] = doc
 
     for rank, doc in enumerate(bm25_docs):
-        key = doc.page_content[:200]
+        key = hashlib.md5(doc.page_content.encode()).hexdigest()
         scores[key] = scores.get(key, 0) + 0.4 * (1.0 / (rrf_k + rank))
         doc_map[key] = doc
 
@@ -329,7 +331,7 @@ def query_rag(
         try:
             retrieved_docs = rerank_documents(question, retrieved_docs, top_k)
         except Exception as e:
-            pass  # reranker 失败不影响主流程，降级为原始排序
+            logging.warning(f"Reranker failed: {e}, falling back to original order")
 
     # 4. 生成回答（LCEL chain）
     llm = get_llm()

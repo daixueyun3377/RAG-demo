@@ -61,7 +61,22 @@
 
 ## 快速开始
 
-### 1. 环境准备
+### 1. 前置准备
+
+你只需要准备两个 API Key：
+
+| Key | 用途 | 获取方式 |
+|-----|------|----------|
+| LLM API Key | 大模型生成回答 | DeepSeek、OpenAI 或其他 OpenAI 兼容接口 |
+| 硅基流动 API Key | Embedding + Reranker | 免费申请，见下方 |
+
+**硅基流动 API Key 申请：**
+1. 访问 [cloud.siliconflow.cn](https://cloud.siliconflow.cn)
+2. 注册账号并登录
+3. 进入「账户管理」→「API 密钥」，创建一个 Key
+4. 新用户赠送免费额度，本项目使用的 bge-large-zh-v1.5（Embedding）和 bge-reranker-v2-m3（Reranker）均为免费模型
+
+### 2. 环境准备
 
 ```bash
 git clone https://github.com/daixueyun3377/RAG-demo.git

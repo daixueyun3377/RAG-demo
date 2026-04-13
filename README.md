@@ -2,6 +2,21 @@
 
 基于 LangChain 的 RAG（检索增强生成）全链路 Demo，覆盖文档加载、多策略切分、向量存储、混合检索、Reranker 重排序、LLM 生成。
 
+## 技术栈
+
+| 组件 | 技术选型 |
+|------|----------|
+| 语言 | Python 3.11 |
+| Web 框架 | FastAPI |
+| RAG 框架 | LangChain 1.x |
+| 向量数据库 | Chroma（嵌入式） |
+| Embedding | BAAI/bge-large-zh-v1.5（硅基流动 API） |
+| Reranker | BAAI/bge-reranker-v2-m3（硅基流动 API） |
+| LLM | DeepSeek / Claude（OpenAI 兼容接口） |
+| 关键词检索 | BM25（rank-bm25） |
+| 可观测性 | Langfuse（可选） |
+| 基础设施 | Docker Compose（Milvus + Redis + Langfuse） |
+
 ## 架构
 
 ```
@@ -40,8 +55,9 @@
 
 | 分支 | 说明 |
 |------|------|
+| `main` | LangChain 版（Chroma + 混合检索 + Reranker + 语义切分） |
 | `dev-p0` | 原生 Python 版（pymilvus + OpenAI SDK，无框架） |
-| `dev-langchain` | LangChain 版（Chroma + 混合检索 + Reranker + 语义切分） |
+| `dev-langchain` | LangChain 开发分支（已合并到 main） |
 
 ## 快速开始
 
@@ -50,7 +66,6 @@
 ```bash
 git clone https://github.com/daixueyun3377/RAG-demo.git
 cd RAG-demo
-git checkout dev-langchain
 pip install -r requirements.txt
 ```
 
@@ -129,15 +144,6 @@ curl -X POST "http://localhost:8080/compare-chunks" \
 | `query_transform` | string | `none` | Query 变换：`none` / `rewrite` / `hyde` |
 | `use_reranker` | bool | `false` | 是否启用 Reranker 重排序 |
 | `top_k` | int | `5` | 返回 Top-K 结果 |
-
-## 技术栈
-
-- **框架**：FastAPI + LangChain 1.x
-- **向量库**：Chroma（嵌入式）
-- **Embedding**：BAAI/bge-large-zh-v1.5（硅基流动 API）
-- **Reranker**：BAAI/bge-reranker-v2-m3（硅基流动 API）
-- **LLM**：DeepSeek / Claude（OpenAI 兼容接口）
-- **可观测**：Langfuse（可选）
 
 ## 项目结构
 

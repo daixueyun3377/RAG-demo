@@ -18,6 +18,11 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "rag_docs")
 
+# Reranker 配置（硅基流动）
+RERANKER_API_KEY = os.getenv("RERANKER_API_KEY", EMBEDDING_API_KEY)  # 默认复用 Embedding Key
+RERANKER_BASE_URL = os.getenv("RERANKER_BASE_URL", "https://api.siliconflow.cn/v1/rerank")
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+
 # Langfuse 配置
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")

@@ -14,6 +14,7 @@ class QueryRequest(BaseModel):
     question: str
     retrieval_mode: Literal["vector", "bm25", "hybrid"] = "hybrid"
     query_transform: Literal["none", "rewrite", "hyde"] = "none"
+    use_reranker: bool = False
     top_k: int = 5
 
 
@@ -31,7 +32,7 @@ def startup():
 @app.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    strategy: str = Query("recursive", description="切分策略: fixed / recursive"),
+    strategy: str = Query("recursive", description="切分策略: fixed / recursive / semantic"),
     chunk_size: int = Query(512, description="切分大小"),
     chunk_overlap: int = Query(50, description="重叠大小"),
 ):
@@ -54,6 +55,7 @@ async def query(req: QueryRequest):
         question=req.question,
         retrieval_mode=req.retrieval_mode,
         query_transform=req.query_transform,
+        use_reranker=req.use_reranker,
         top_k=req.top_k,
     )
     return result

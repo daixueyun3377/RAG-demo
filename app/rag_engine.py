@@ -1,11 +1,13 @@
 # RAG 核心引擎 - LangChain 版
 # 覆盖：DocumentLoader, TextSplitter(多策略), Chroma, BM25混合检索, Reranker, RetrievalQA
 import os
+import requests
 from typing import Literal
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.document_loaders import TextLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter, CharacterTextSplitter
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.vectorstores import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.prompts import ChatPromptTemplate
@@ -72,7 +74,7 @@ def load_directory(dir_path: str) -> list[Document]:
 
 def split_documents(
     documents: list[Document],
-    strategy: Literal["fixed", "recursive"] = "recursive",
+    strategy: Literal["fixed", "recursive", "semantic"] = "recursive",
     chunk_size: int = CHUNK_SIZE,
     chunk_overlap: int = CHUNK_OVERLAP,
 ) -> list[Document]:
@@ -80,6 +82,7 @@ def split_documents(
     多策略文本切分
     - fixed: 固定长度切分 (CharacterTextSplitter)
     - recursive: 递归切分 (RecursiveCharacterTextSplitter) — 推荐
+    - semantic: 语义切分 (SemanticChunker) — 基于 embedding 相似度判断边界
     """
     if strategy == "fixed":
         splitter = CharacterTextSplitter(
@@ -92,6 +95,12 @@ def split_documents(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             separators=["\n\n", "\n", "。", "！", "？", ".", " ", ""],
+        )
+    elif strategy == "semantic":
+        splitter = SemanticChunker(
+            embeddings=get_embeddings(),
+            breakpoint_threshold_type="percentile",  # percentile / standard_deviation / interquartile
+            breakpoint_threshold_amount=80,  # 相似度低于 80 分位时切分
         )
     else:
         raise ValueError(f"未知切分策略: {strategy}")
@@ -197,6 +206,40 @@ def hybrid_retrieve(query: str, top_k: int = TOP_K) -> list[Document]:
     return [doc_map[k] for k in sorted_keys]
 
 
+# ========== Reranker（重排序）==========
+
+def rerank_documents(query: str, documents: list[Document], top_k: int = TOP_K) -> list[Document]:
+    """
+    使用 BGE Reranker 对检索结果二次排序
+    调用硅基流动 rerank API (BAAI/bge-reranker-v2-m3)
+    """
+    if not documents:
+        return documents
+
+    resp = requests.post(
+        RERANKER_BASE_URL,
+        headers={"Authorization": f"Bearer {RERANKER_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": RERANKER_MODEL,
+            "query": query,
+            "documents": [doc.page_content for doc in documents],
+            "top_n": min(top_k, len(documents)),
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+
+    # 按 relevance_score 降序排列，返回重排后的文档
+    reranked = []
+    for item in sorted(results, key=lambda x: x["relevance_score"], reverse=True):
+        idx = item["index"]
+        doc = documents[idx]
+        doc.metadata["rerank_score"] = item["relevance_score"]
+        reranked.append(doc)
+    return reranked
+
+
 # ========== Query 改写 / HyDE ==========
 
 def rewrite_query(query: str) -> str:
@@ -249,6 +292,7 @@ def query_rag(
     question: str,
     retrieval_mode: Literal["vector", "bm25", "hybrid"] = "hybrid",
     query_transform: Literal["none", "rewrite", "hyde"] = "none",
+    use_reranker: bool = False,
     top_k: int = TOP_K,
 ) -> dict:
     """
@@ -280,6 +324,13 @@ def query_rag(
     else:
         retrieved_docs = hybrid_retrieve(search_query, top_k)
 
+    # 3. Reranker 重排序
+    if use_reranker and retrieved_docs:
+        try:
+            retrieved_docs = rerank_documents(question, retrieved_docs, top_k)
+        except Exception as e:
+            pass  # reranker 失败不影响主流程，降级为原始排序
+
     # 4. 生成回答（LCEL chain）
     llm = get_llm()
     chain = RAG_PROMPT | llm | StrOutputParser()
@@ -302,6 +353,7 @@ def query_rag(
         "config": {
             "retrieval_mode": retrieval_mode,
             "query_transform": transform_info,
+            "use_reranker": use_reranker,
             "top_k": top_k,
         },
     }
@@ -310,10 +362,11 @@ def query_rag(
 # ========== 切分策略对比工具 ==========
 
 def compare_chunk_strategies(file_path: str) -> dict:
-    """对比不同切分策略和 chunk_size 的效果"""
+    """对比不同切分策略和 chunk_size 的效果（fixed / recursive / semantic）"""
     docs = load_file(file_path)
     results = {}
 
+    # fixed + recursive: 对比不同 chunk_size
     for strategy in ["fixed", "recursive"]:
         for size in [256, 512, 1024]:
             chunks = split_documents(docs, strategy=strategy, chunk_size=size, chunk_overlap=size // 10)
@@ -322,8 +375,21 @@ def compare_chunk_strategies(file_path: str) -> dict:
                 "strategy": strategy,
                 "chunk_size": size,
                 "num_chunks": len(chunks),
-                "avg_length": sum(len(c.page_content) for c in chunks) / max(len(chunks), 1),
+                "avg_length": round(sum(len(c.page_content) for c in chunks) / max(len(chunks), 1), 1),
                 "sample": chunks[0].page_content[:200] if chunks else "",
             }
+
+    # semantic: 基于 embedding 语义切分（无需指定 chunk_size）
+    try:
+        semantic_chunks = split_documents(docs, strategy="semantic")
+        results["semantic"] = {
+            "strategy": "semantic",
+            "chunk_size": "auto (embedding-based)",
+            "num_chunks": len(semantic_chunks),
+            "avg_length": round(sum(len(c.page_content) for c in semantic_chunks) / max(len(semantic_chunks), 1), 1),
+            "sample": semantic_chunks[0].page_content[:200] if semantic_chunks else "",
+        }
+    except Exception as e:
+        results["semantic"] = {"strategy": "semantic", "error": str(e)}
 
     return results

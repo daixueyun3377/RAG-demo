@@ -6,8 +6,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from pydantic import BaseModel
 from app.config import DOCS_DIR
 from app.rag_engine import ingest_file, query_rag, compare_chunk_strategies
+from app.memory_routes import router as memory_router
 
-app = FastAPI(title="RAG Demo - LangChain", version="0.2.0")
+app = FastAPI(title="RAG Demo - LangChain + Memory", version="0.3.0")
+app.include_router(memory_router)
 
 
 class QueryRequest(BaseModel):
@@ -77,4 +79,4 @@ async def compare_chunks(file: UploadFile = File(...)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0-langchain"}
+    return {"status": "ok", "version": "0.3.0-memory"}

@@ -7,10 +7,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from app.config import DOCS_DIR
 from app.rag_engine import ingest_file, query_rag, compare_chunk_strategies, load_file, split_documents
-from app.memory_routes import router as memory_router
 
-app = FastAPI(title="RAG Demo - LangChain + Memory", version="0.3.0")
-app.include_router(memory_router)
+app = FastAPI(title="RAG Demo - LangChain", version="0.3.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -121,4 +119,4 @@ async def compare_chunks_detail(file: UploadFile = File(...)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.3.0-memory"}
+    return {"status": "ok", "version": "0.3.0"}

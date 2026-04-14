@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 工作记忆 (Working Memory)
 =========================

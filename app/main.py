@@ -3,13 +3,15 @@ import os
 import shutil
 from typing import Literal
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from app.config import DOCS_DIR
-from app.rag_engine import ingest_file, query_rag, compare_chunk_strategies
+from app.rag_engine import ingest_file, query_rag, compare_chunk_strategies, load_file, split_documents
 from app.memory_routes import router as memory_router
 
 app = FastAPI(title="RAG Demo - LangChain + Memory", version="0.3.0")
 app.include_router(memory_router)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 class QueryRequest(BaseModel):
@@ -75,6 +77,46 @@ async def compare_chunks(file: UploadFile = File(...)):
 
     result = compare_chunk_strategies(file_path)
     return result
+
+
+@app.post("/compare-chunks-detail")
+async def compare_chunks_detail(file: UploadFile = File(...)):
+    """对比不同切分策略 — 返回每个 chunk 的完整内容"""
+    if not file.filename.endswith((".txt", ".md")):
+        raise HTTPException(400, "目前只支持 .txt 和 .md 文件")
+
+    file_path = os.path.join(DOCS_DIR, file.filename)
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    docs = load_file(file_path)
+    results = {}
+
+    for strategy in ["fixed", "recursive"]:
+        for size in [256, 512, 1024]:
+            chunks = split_documents(docs, strategy=strategy, chunk_size=size, chunk_overlap=size // 10)
+            key = f"{strategy}_{size}"
+            results[key] = {
+                "strategy": strategy,
+                "chunk_size": size,
+                "num_chunks": len(chunks),
+                "avg_length": round(sum(len(c.page_content) for c in chunks) / max(len(chunks), 1), 1),
+                "chunks": [c.page_content for c in chunks],
+            }
+
+    try:
+        semantic_chunks = split_documents(docs, strategy="semantic")
+        results["semantic"] = {
+            "strategy": "semantic",
+            "chunk_size": "auto (embedding-based)",
+            "num_chunks": len(semantic_chunks),
+            "avg_length": round(sum(len(c.page_content) for c in semantic_chunks) / max(len(semantic_chunks), 1), 1),
+            "chunks": [c.page_content for c in semantic_chunks],
+        }
+    except Exception as e:
+        results["semantic"] = {"strategy": "semantic", "error": str(e)}
+
+    return results
 
 
 @app.get("/health")

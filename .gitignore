@@ -7,3 +7,5 @@ docs/*.md
 test_result.txt
 test_query.py
 .venv/
+.DS_Store
+.vscode/

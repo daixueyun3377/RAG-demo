@@ -1,18 +1,32 @@
 # FastAPI 入口 - LangGraph 版
 import os
 import shutil
+from contextlib import asynccontextmanager
 from typing import Literal
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
-from app.config import DOCS_DIR
-from app.rag_graph import (
-    ingest_file, query_rag, compare_chunk_strategies,
-    load_file, split_documents, rag_graph,
-)
 
-app = FastAPI(title="RAG Demo - LangGraph", version="0.5.0")
+from app.config import DOCS_DIR
+from app.llm import get_llm, get_embeddings
+from app.retriever import (
+    get_vectorstore, load_file, split_documents, compare_chunk_strategies,
+    ingest_file,
+)
+from app.ingest import smart_ingest_file, ingest_graph
+from app.rag_graph import query_rag, query_rag_stream, rag_graph
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    os.makedirs(DOCS_DIR, exist_ok=True)
+    yield
+
+
+app = FastAPI(title="RAG Demo - LangGraph", version="0.6.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -22,11 +36,6 @@ class QueryRequest(BaseModel):
     query_transform: Literal["none", "rewrite", "hyde"] = "none"
     use_reranker: bool = False
     top_k: int = 5
-
-
-@app.on_event("startup")
-def startup():
-    os.makedirs(DOCS_DIR, exist_ok=True)
 
 
 @app.post("/upload")
@@ -48,6 +57,20 @@ async def upload_document(
     return {"message": f"成功入库 {result['chunks']} 个文本块", **result}
 
 
+@app.post("/smart-upload")
+async def smart_upload_document(file: UploadFile = File(...)):
+    """智能上传 — 规则分析文档特征，动态选择最佳切分策略，质量验证+降级重试（LangGraph 版）"""
+    if not file.filename.endswith((".txt", ".md")):
+        raise HTTPException(400, "目前只支持 .txt 和 .md 文件")
+
+    file_path = os.path.join(DOCS_DIR, file.filename)
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    result = smart_ingest_file(file_path)
+    return {"message": f"智能入库完成：{result['strategy']} 策略，{result['chunks']} 个文本块", **result}
+
+
 @app.post("/query")
 async def query(req: QueryRequest):
     """LangGraph RAG 查询（返回结果含 graph_steps 执行轨迹）"""
@@ -61,22 +84,55 @@ async def query(req: QueryRequest):
     return result
 
 
+@app.post("/query/stream")
+async def query_stream(req: QueryRequest):
+    """LangGraph RAG 流式查询（SSE），逐 token 输出生成结果"""
+    return StreamingResponse(
+        query_rag_stream(
+            question=req.question,
+            retrieval_mode=req.retrieval_mode,
+            query_transform=req.query_transform,
+            use_reranker=req.use_reranker,
+            top_k=req.top_k,
+        ),
+        media_type="text/event-stream",
+    )
+
+
 @app.get("/graph", response_class=HTMLResponse)
 async def graph_visualization():
     """LangGraph 流程图可视化（Mermaid）"""
     try:
-        mermaid_png = rag_graph.get_graph().draw_mermaid()
+        mermaid_src = rag_graph.get_graph().draw_mermaid()
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>RAG Graph</title>
 <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
 </head><body>
 <h2>RAG LangGraph 流程图</h2>
-<pre class="mermaid">{mermaid_png}</pre>
+<pre class="mermaid">{mermaid_src}</pre>
 <script>mermaid.initialize({{startOnLoad:true}});</script>
 </body></html>"""
         return html
     except Exception as e:
         return f"<pre>Graph export error: {e}\n\nMermaid source:\n{rag_graph.get_graph().draw_mermaid()}</pre>"
+
+
+@app.get("/ingest-graph", response_class=HTMLResponse)
+async def ingest_graph_visualization():
+    """智能入库 LangGraph 流程图可视化（Mermaid）"""
+    try:
+        mermaid_src = ingest_graph.get_graph().draw_mermaid()
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Ingest Graph</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+</head><body>
+<h2>智能入库 LangGraph 流程图</h2>
+<pre class="mermaid">{mermaid_src}</pre>
+<script>mermaid.initialize({{startOnLoad:true}});</script>
+</body></html>"""
+        return html
+    except Exception as e:
+        return f"<pre>Graph export error: {e}</pre>"
 
 
 @app.post("/compare-chunks")
@@ -133,4 +189,36 @@ async def compare_chunks_detail(file: UploadFile = File(...)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.5.0-langgraph"}
+    """健康检查 — 检测 LLM、Embedding、Chroma 服务状态"""
+    checks = {}
+
+    # LLM
+    try:
+        llm = get_llm()
+        llm.invoke("ping")
+        checks["llm"] = "ok"
+    except Exception as e:
+        checks["llm"] = f"error: {e}"
+
+    # Embedding
+    try:
+        emb = get_embeddings()
+        emb.embed_query("ping")
+        checks["embedding"] = "ok"
+    except Exception as e:
+        checks["embedding"] = f"error: {e}"
+
+    # Chroma
+    try:
+        vs = get_vectorstore()
+        count = vs._collection.count()
+        checks["chroma"] = f"ok ({count} docs)"
+    except Exception as e:
+        checks["chroma"] = f"error: {e}"
+
+    all_ok = all(v.startswith("ok") for v in checks.values())
+    return {
+        "status": "ok" if all_ok else "degraded",
+        "version": "0.6.0-langgraph",
+        "services": checks,
+    }

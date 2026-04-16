@@ -1,224 +1,23 @@
-# RAG 核心引擎 - LangGraph 版
-# 将 RAG 全流程建模为显式状态图：
+# RAG 查询图 — LangGraph 版
+# 将 RAG 查询流程建模为显式状态图：
 #   query变换 → 检索 → 文档评估 → (重排序) → 生成 → 幻觉检测 → 输出/重试
-#
-# 相比 LangChain LCEL 版本的核心升级：
-#   1. 文档相关性评估 (grade_documents) — LLM 判断每篇文档是否与问题相关
-#   2. 幻觉检测 (check_hallucination) — LLM 验证回答是否有文档依据
-#   3. 条件路由 — 无相关文档时走 fallback，检测到幻觉时自动重试
-#   4. 全流程可视化 — LangGraph 原生支持 Mermaid 图导出
 
-import os
+import re
 import logging
-import hashlib
-import requests
-from typing import Literal, TypedDict, Annotated
+from typing import Literal, TypedDict
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.document_loaders import TextLoader, DirectoryLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter, CharacterTextSplitter
-from langchain_experimental.text_splitter import SemanticChunker
-from langchain_community.vectorstores import Chroma
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.documents import Document
 from langgraph.graph import StateGraph, START, END
 
-try:
-    from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
-except (ImportError, ModuleNotFoundError):
-    LangfuseCallbackHandler = None
-
-from app.config import *
+from app.config import TOP_K
+from app.llm import get_llm, get_langfuse_handler
+from app.retriever import (
+    get_vector_retriever, get_bm25_retriever, hybrid_retrieve,
+    rerank_documents,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# ================================================================
-# 初始化
-# ================================================================
-
-def get_llm():
-    return ChatOpenAI(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
-        model=LLM_MODEL,
-        temperature=0.3,
-        max_tokens=1024,
-    )
-
-
-def get_embeddings():
-    return OpenAIEmbeddings(
-        api_key=EMBEDDING_API_KEY,
-        base_url=EMBEDDING_BASE_URL,
-        model=EMBEDDING_MODEL,
-    )
-
-
-def get_langfuse_handler():
-    if LangfuseCallbackHandler and LANGFUSE_SECRET_KEY and LANGFUSE_PUBLIC_KEY:
-        return LangfuseCallbackHandler(
-            secret_key=LANGFUSE_SECRET_KEY,
-            public_key=LANGFUSE_PUBLIC_KEY,
-            host=LANGFUSE_HOST,
-        )
-    return None
-
-
-# ================================================================
-# 文档加载 & 切分（与原版一致，入库流程不变）
-# ================================================================
-
-def load_file(file_path: str) -> list[Document]:
-    if file_path.endswith((".md", ".txt")):
-        loader = TextLoader(file_path, encoding="utf-8")
-    else:
-        raise ValueError(f"不支持的文件格式: {file_path}")
-    return loader.load()
-
-
-def load_directory(dir_path: str) -> list[Document]:
-    loader = DirectoryLoader(dir_path, glob="**/*.md", loader_cls=TextLoader, loader_kwargs={"encoding": "utf-8"})
-    return loader.load()
-
-
-def split_documents(
-    documents: list[Document],
-    strategy: Literal["fixed", "recursive", "semantic"] = "recursive",
-    chunk_size: int = CHUNK_SIZE,
-    chunk_overlap: int = CHUNK_OVERLAP,
-) -> list[Document]:
-    if strategy == "fixed":
-        splitter = CharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, separator="\n")
-    elif strategy == "recursive":
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size, chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", "。", "！", "？", ".", " ", ""],
-        )
-    elif strategy == "semantic":
-        splitter = SemanticChunker(
-            embeddings=get_embeddings(),
-            breakpoint_threshold_type="percentile",
-            breakpoint_threshold_amount=80,
-        )
-    else:
-        raise ValueError(f"未知切分策略: {strategy}")
-    return splitter.split_documents(documents)
-
-
-# ================================================================
-# 向量存储 & 入库
-# ================================================================
-
-_vectorstore = None
-_all_docs_for_bm25: list[Document] = []
-
-
-def get_vectorstore() -> Chroma:
-    global _vectorstore
-    if _vectorstore is None:
-        _vectorstore = Chroma(
-            collection_name=CHROMA_COLLECTION,
-            embedding_function=get_embeddings(),
-            persist_directory=CHROMA_PERSIST_DIR,
-        )
-    return _vectorstore
-
-
-def ingest_documents(documents: list[Document]) -> int:
-    global _all_docs_for_bm25
-    vs = get_vectorstore()
-    vs.add_documents(documents)
-    _all_docs_for_bm25.extend(documents)
-    return len(documents)
-
-
-def ingest_file(
-    file_path: str,
-    strategy: str = "recursive",
-    chunk_size: int = CHUNK_SIZE,
-    chunk_overlap: int = CHUNK_OVERLAP,
-) -> dict:
-    docs = load_file(file_path)
-    chunks = split_documents(docs, strategy=strategy, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    count = ingest_documents(chunks)
-    return {"filename": os.path.basename(file_path), "chunks": count, "strategy": strategy, "chunk_size": chunk_size}
-
-
-# ================================================================
-# 检索器
-# ================================================================
-
-def _get_vector_retriever(top_k: int = TOP_K):
-    return get_vectorstore().as_retriever(search_kwargs={"k": top_k})
-
-
-def _get_bm25_retriever(top_k: int = TOP_K):
-    global _all_docs_for_bm25
-    if not _all_docs_for_bm25:
-        vs = get_vectorstore()
-        results = vs.get()
-        if results and results["documents"]:
-            _all_docs_for_bm25 = [
-                Document(page_content=doc, metadata=meta)
-                for doc, meta in zip(results["documents"], results["metadatas"])
-            ]
-    if not _all_docs_for_bm25:
-        return None
-    return BM25Retriever.from_documents(_all_docs_for_bm25, k=top_k)
-
-
-def _hybrid_retrieve(query: str, top_k: int = TOP_K) -> list[Document]:
-    vector_docs = _get_vector_retriever(top_k).invoke(query)
-    bm25 = _get_bm25_retriever(top_k)
-    bm25_docs = bm25.invoke(query) if bm25 else []
-
-    rrf_k = 60
-    scores: dict[str, float] = {}
-    doc_map: dict[str, Document] = {}
-
-    for rank, doc in enumerate(vector_docs):
-        key = hashlib.md5(doc.page_content.encode()).hexdigest()
-        scores[key] = scores.get(key, 0) + 0.6 * (1.0 / (rrf_k + rank))
-        doc_map[key] = doc
-
-    for rank, doc in enumerate(bm25_docs):
-        key = hashlib.md5(doc.page_content.encode()).hexdigest()
-        scores[key] = scores.get(key, 0) + 0.4 * (1.0 / (rrf_k + rank))
-        doc_map[key] = doc
-
-    sorted_keys = sorted(scores, key=scores.get, reverse=True)[:top_k]
-    return [doc_map[k] for k in sorted_keys]
-
-
-# ================================================================
-# Reranker
-# ================================================================
-
-def _rerank_documents(query: str, documents: list[Document], top_k: int = TOP_K) -> list[Document]:
-    if not documents:
-        return documents
-    resp = requests.post(
-        RERANKER_BASE_URL,
-        headers={"Authorization": f"Bearer {RERANKER_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": RERANKER_MODEL,
-            "query": query,
-            "documents": [doc.page_content for doc in documents],
-            "top_n": min(top_k, len(documents)),
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
-    reranked = []
-    for item in sorted(results, key=lambda x: x["relevance_score"], reverse=True):
-        doc = documents[item["index"]]
-        doc.metadata["rerank_score"] = item["relevance_score"]
-        reranked.append(doc)
-    return reranked
 
 
 # ================================================================
@@ -227,23 +26,23 @@ def _rerank_documents(query: str, documents: list[Document], top_k: int = TOP_K)
 
 class RAGState(TypedDict):
     """RAG 图的全局状态"""
-    question: str                # 用户原始问题
-    search_query: str            # 变换后的检索 query
-    retrieval_mode: str          # vector / bm25 / hybrid
-    query_transform: str         # none / rewrite / hyde
+    question: str
+    search_query: str
+    retrieval_mode: str
+    query_transform: str
     use_reranker: bool
     top_k: int
-    retrieved_docs: list         # 检索到的文档
-    relevant_docs: list          # 经过相关性评估后的文档
-    answer: str                  # 生成的回答
-    hallucination_pass: bool     # 幻觉检测是否通过
-    retry_count: int             # 重试次数
-    sources: list                # 来源信息
-    steps: list                  # 执行步骤记录（用于调试）
+    retrieved_docs: list
+    relevant_docs: list
+    answer: str
+    hallucination_pass: bool
+    retry_count: int
+    sources: list
+    steps: list
 
 
 # ================================================================
-# Graph Nodes — 每个 node 接收 state，返回 state 的部分更新
+# Graph Nodes
 # ================================================================
 
 def transform_query(state: RAGState) -> dict:
@@ -279,12 +78,12 @@ def retrieve(state: RAGState) -> dict:
     top_k = state.get("top_k", TOP_K)
 
     if mode == "vector":
-        docs = _get_vector_retriever(top_k).invoke(query)
+        docs = get_vector_retriever(top_k).invoke(query)
     elif mode == "bm25":
-        retriever = _get_bm25_retriever(top_k)
+        retriever = get_bm25_retriever(top_k)
         docs = retriever.invoke(query) if retriever else []
     else:
-        docs = _hybrid_retrieve(query, top_k)
+        docs = hybrid_retrieve(query, top_k)
 
     return {
         "retrieved_docs": docs,
@@ -292,29 +91,69 @@ def retrieve(state: RAGState) -> dict:
     }
 
 
+def _parse_grade_result(raw: str, num_docs: int) -> list[bool]:
+    """
+    解析 LLM 批量评估结果，增强鲁棒性。
+    支持格式：
+      - 每行 yes/no
+      - 带编号：[文档0] yes / 1. yes / 文档0: yes
+      - 带额外文字：yes, this is relevant
+    返回长度为 num_docs 的 bool 列表，解析失败的位置保守返回 True。
+    """
+    results = [True] * num_docs  # 默认保守保留
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    parsed_idx = 0
+
+    for line in lines:
+        if parsed_idx >= num_docs:
+            break
+        lower = line.lower()
+        # 去掉常见前缀：[文档0]、1.、文档0:
+        cleaned = re.sub(r"^(\[?文档\s*\d+\]?[:\s]*|\d+[.)\]:\s]+)", "", lower).strip()
+        if cleaned.startswith("yes"):
+            results[parsed_idx] = True
+            parsed_idx += 1
+        elif cleaned.startswith("no"):
+            results[parsed_idx] = False
+            parsed_idx += 1
+        # 跳过无法解析的行（不推进 index）
+
+    return results
+
+
 def grade_documents(state: RAGState) -> dict:
-    """Node 3: 文档相关性评估 — LLM 逐篇判断文档是否与问题相关（LangGraph 经典模式）"""
+    """Node 3: 文档相关性评估 — LLM 批量判断文档是否与问题相关"""
     question = state["question"]
     docs = state["retrieved_docs"]
+
+    if not docs:
+        return {
+            "relevant_docs": [],
+            "steps": state.get("steps", []) + ["grade_documents → 0/0 relevant (no docs)"],
+        }
+
     llm = get_llm()
 
+    doc_list = "\n\n".join(
+        f"[文档{i}]\n{doc.page_content}" for i, doc in enumerate(docs)
+    )
     grade_prompt = ChatPromptTemplate.from_template(
-        "你是一个文档相关性评估专家。判断以下文档是否与用户问题相关。\n"
-        "只回答 'yes' 或 'no'，不要解释。\n\n"
+        "你是一个文档相关性评估专家。判断以下每篇文档是否与用户问题相关。\n"
+        "请对每篇文档只回答 'yes' 或 'no'，每行一个结果，顺序与文档编号一致。\n"
+        "不要解释，不要输出其他内容。\n\n"
         "用户问题：{question}\n\n"
-        "文档内容：{document}"
+        "文档列表：\n{documents}"
     )
     chain = grade_prompt | llm | StrOutputParser()
+    raw_result = chain.invoke({"question": question, "documents": doc_list}).strip()
 
-    relevant = []
-    for doc in docs:
-        score = chain.invoke({"question": question, "document": doc.page_content}).strip().lower()
-        if score.startswith("yes"):
-            relevant.append(doc)
+    grade_results = _parse_grade_result(raw_result, len(docs))
+    relevant = [doc for doc, is_relevant in zip(docs, grade_results) if is_relevant]
 
     return {
         "relevant_docs": relevant,
-        "steps": state.get("steps", []) + [f"grade_documents → {len(relevant)}/{len(docs)} relevant"],
+        "steps": state.get("steps", []) + [f"grade_documents(batch) → {len(relevant)}/{len(docs)} relevant"],
     }
 
 
@@ -328,7 +167,7 @@ def rerank(state: RAGState) -> dict:
         return {"relevant_docs": docs, "steps": state.get("steps", []) + ["rerank_skipped"]}
 
     try:
-        reranked = _rerank_documents(question, docs, top_k)
+        reranked = rerank_documents(question, docs, top_k)
         return {"relevant_docs": reranked, "steps": state.get("steps", []) + [f"rerank → {len(reranked)} docs"]}
     except Exception as e:
         logger.warning(f"Reranker failed: {e}, using original order")
@@ -343,7 +182,6 @@ def generate(state: RAGState) -> dict:
     langfuse_handler = get_langfuse_handler()
     callbacks = [langfuse_handler] if langfuse_handler else []
 
-    # 格式化文档
     context_parts = []
     for doc in docs:
         source = doc.metadata.get("source", "未知")
@@ -396,10 +234,10 @@ def check_hallucination(state: RAGState) -> dict:
 
 
 def fallback(state: RAGState) -> dict:
-    """Node 7: 兜底回答 — 无相关文档或幻觉检测多次失败时触发"""
+    """Node 7: 兜底回答"""
     return {
         "answer": "抱歉，知识库中没有找到与您问题相关的可靠信息。请尝试换个问法，或上传更多相关文档。",
-        "hallucination_pass": True,  # 标记为通过，终止循环
+        "hallucination_pass": True,
         "steps": state.get("steps", []) + ["fallback"],
     }
 
@@ -409,14 +247,12 @@ def fallback(state: RAGState) -> dict:
 # ================================================================
 
 def route_after_grading(state: RAGState) -> str:
-    """文档评估后的路由：有相关文档 → rerank，无相关文档 → fallback"""
     if state.get("relevant_docs"):
         return "rerank"
     return "fallback"
 
 
 def route_after_hallucination(state: RAGState) -> str:
-    """幻觉检测后的路由：通过 → 结束，未通过且重试<2次 → 重新生成，否则 → fallback"""
     if state.get("hallucination_pass", False):
         return "finish"
     if state.get("retry_count", 0) < 2:
@@ -448,7 +284,6 @@ def build_rag_graph() -> StateGraph:
     """
     graph = StateGraph(RAGState)
 
-    # 添加节点
     graph.add_node("transform_query", transform_query)
     graph.add_node("retrieve", retrieve)
     graph.add_node("grade_documents", grade_documents)
@@ -457,12 +292,10 @@ def build_rag_graph() -> StateGraph:
     graph.add_node("check_hallucination", check_hallucination)
     graph.add_node("fallback", fallback)
 
-    # 添加边
     graph.add_edge(START, "transform_query")
     graph.add_edge("transform_query", "retrieve")
     graph.add_edge("retrieve", "grade_documents")
 
-    # 条件边：文档评估后
     graph.add_conditional_edges(
         "grade_documents",
         route_after_grading,
@@ -472,7 +305,6 @@ def build_rag_graph() -> StateGraph:
     graph.add_edge("rerank", "generate")
     graph.add_edge("generate", "check_hallucination")
 
-    # 条件边：幻觉检测后
     graph.add_conditional_edges(
         "check_hallucination",
         route_after_hallucination,
@@ -489,6 +321,46 @@ rag_graph = build_rag_graph()
 
 
 # ================================================================
+# 流式查询图（无幻觉检测，避免已输出内容被重试覆盖）
+# ================================================================
+
+def _build_stream_graph():
+    """
+    流式查询专用图：去掉幻觉检测环节。
+    流式场景下 token 已经逐个发送给客户端，如果幻觉检测不通过触发重试，
+    用户会看到两段矛盾的输出，体验很差。因此流式模式只走：
+    transform_query → retrieve → grade_documents → rerank → generate → END
+    """
+    graph = StateGraph(RAGState)
+
+    graph.add_node("transform_query", transform_query)
+    graph.add_node("retrieve", retrieve)
+    graph.add_node("grade_documents", grade_documents)
+    graph.add_node("rerank", rerank)
+    graph.add_node("generate", generate)
+    graph.add_node("fallback", fallback)
+
+    graph.add_edge(START, "transform_query")
+    graph.add_edge("transform_query", "retrieve")
+    graph.add_edge("retrieve", "grade_documents")
+
+    graph.add_conditional_edges(
+        "grade_documents",
+        route_after_grading,
+        {"rerank": "rerank", "fallback": "fallback"},
+    )
+
+    graph.add_edge("rerank", "generate")
+    graph.add_edge("generate", END)
+    graph.add_edge("fallback", END)
+
+    return graph.compile()
+
+
+stream_rag_graph = _build_stream_graph()
+
+
+# ================================================================
 # 对外接口
 # ================================================================
 
@@ -499,10 +371,7 @@ def query_rag(
     use_reranker: bool = False,
     top_k: int = TOP_K,
 ) -> dict:
-    """
-    LangGraph 版 RAG 查询入口
-    接口签名与原版完全一致，内部走状态图
-    """
+    """LangGraph 版 RAG 查询入口"""
     initial_state: RAGState = {
         "question": question,
         "search_query": "",
@@ -519,7 +388,6 @@ def query_rag(
         "steps": [],
     }
 
-    # 执行图
     final_state = rag_graph.invoke(initial_state)
 
     return {
@@ -535,36 +403,49 @@ def query_rag(
     }
 
 
-# ================================================================
-# 切分策略对比（不变）
-# ================================================================
+async def query_rag_stream(
+    question: str,
+    retrieval_mode: Literal["vector", "bm25", "hybrid"] = "hybrid",
+    query_transform: Literal["none", "rewrite", "hyde"] = "none",
+    use_reranker: bool = False,
+    top_k: int = TOP_K,
+):
+    """
+    LangGraph 版 RAG 流式查询入口。
+    使用专用的 stream_rag_graph（无幻觉检测），避免已输出 token 被重试覆盖。
+    """
+    import json as _json_stream
 
-def compare_chunk_strategies(file_path: str) -> dict:
-    docs = load_file(file_path)
-    results = {}
+    initial_state: RAGState = {
+        "question": question,
+        "search_query": "",
+        "retrieval_mode": retrieval_mode,
+        "query_transform": query_transform,
+        "use_reranker": use_reranker,
+        "top_k": top_k,
+        "retrieved_docs": [],
+        "relevant_docs": [],
+        "answer": "",
+        "hallucination_pass": False,
+        "retry_count": 0,
+        "sources": [],
+        "steps": [],
+    }
 
-    for strategy in ["fixed", "recursive"]:
-        for size in [256, 512, 1024]:
-            chunks = split_documents(docs, strategy=strategy, chunk_size=size, chunk_overlap=size // 10)
-            key = f"{strategy}_{size}"
-            results[key] = {
-                "strategy": strategy,
-                "chunk_size": size,
-                "num_chunks": len(chunks),
-                "avg_length": round(sum(len(c.page_content) for c in chunks) / max(len(chunks), 1), 1),
-                "sample": chunks[0].page_content[:200] if chunks else "",
-            }
+    async for event in stream_rag_graph.astream_events(initial_state, version="v2"):
+        kind = event.get("event", "")
+        if kind == "on_chat_model_stream":
+            chunk = event.get("data", {}).get("chunk")
+            if chunk and hasattr(chunk, "content") and chunk.content:
+                yield f"data: {_json_stream.dumps({'type': 'token', 'content': chunk.content}, ensure_ascii=False)}\n\n"
+        elif kind == "on_chain_end" and event.get("name") in (
+            "transform_query", "retrieve", "grade_documents", "rerank",
+            "generate", "fallback",
+        ):
+            node_name = event["name"]
+            output = event.get("data", {}).get("output", {})
+            steps = output.get("steps", [])
+            if steps:
+                yield f"data: {_json_stream.dumps({'type': 'step', 'node': node_name, 'step': steps[-1]}, ensure_ascii=False)}\n\n"
 
-    try:
-        semantic_chunks = split_documents(docs, strategy="semantic")
-        results["semantic"] = {
-            "strategy": "semantic",
-            "chunk_size": "auto (embedding-based)",
-            "num_chunks": len(semantic_chunks),
-            "avg_length": round(sum(len(c.page_content) for c in semantic_chunks) / max(len(semantic_chunks), 1), 1),
-            "sample": semantic_chunks[0].page_content[:200] if semantic_chunks else "",
-        }
-    except Exception as e:
-        results["semantic"] = {"strategy": "semantic", "error": str(e)}
-
-    return results
+    yield f"data: {_json_stream.dumps({'type': 'done'})}\n\n"

@@ -6,3 +6,8 @@ docs/*.md
 !docs/sample.md
 test_result.txt
 test_query.py
+.venv/
+.pytest_cache/
+.vscode/
+.DS_Store
+.coverage

@@ -4,9 +4,12 @@ import logging
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 try:
-    from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+    from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 except (ImportError, ModuleNotFoundError):
-    LangfuseCallbackHandler = None
+    try:
+        from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+    except (ImportError, ModuleNotFoundError):
+        LangfuseCallbackHandler = None
 
 from app.config import (
     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL,

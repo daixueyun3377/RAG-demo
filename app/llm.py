@@ -35,11 +35,43 @@ def get_embeddings():
     )
 
 
-def get_langfuse_handler():
-    if LangfuseCallbackHandler and LANGFUSE_SECRET_KEY and LANGFUSE_PUBLIC_KEY:
-        return LangfuseCallbackHandler(
+def _is_langfuse_enabled() -> bool:
+    """检查 Langfuse 是否已配置且可用"""
+    return bool(LangfuseCallbackHandler and LANGFUSE_SECRET_KEY and LANGFUSE_PUBLIC_KEY)
+
+
+def get_langfuse_handler(
+    trace_name: str = "rag-query",
+    session_id: str | None = None,
+    user_id: str | None = None,
+    metadata: dict | None = None,
+):
+    """
+    创建 Langfuse CallbackHandler，支持 trace 级别的上下文。
+
+    同一次 RAG 查询应共享同一个 handler，这样所有 LLM 调用
+    会归到同一条 trace 下，在 Langfuse 面板中可以看到完整链路。
+
+    Args:
+        trace_name: trace 名称，用于在 Langfuse 中标识查询类型
+        session_id: 会话 ID，同一用户的多次查询可归到同一 session
+        user_id: 用户标识
+        metadata: 附加元数据（如 retrieval_mode, query_transform 等）
+    """
+    if not _is_langfuse_enabled():
+        return None
+
+    try:
+        handler = LangfuseCallbackHandler(
             secret_key=LANGFUSE_SECRET_KEY,
             public_key=LANGFUSE_PUBLIC_KEY,
             host=LANGFUSE_HOST,
+            trace_name=trace_name,
+            session_id=session_id,
+            user_id=user_id,
+            metadata=metadata or {},
         )
-    return None
+        return handler
+    except Exception as e:
+        logger.warning(f"Langfuse handler 创建失败: {e}")
+        return None

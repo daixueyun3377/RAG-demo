@@ -1,5 +1,6 @@
-# FastAPI 入口 - LangGraph 版
+# FastAPI 入口 - LangGraph 版（Langfuse 全链路追踪）
 import os
+import uuid
 import shutil
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -10,7 +11,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.config import DOCS_DIR
-from app.llm import get_llm, get_embeddings
+from app.llm import get_llm, get_embeddings, _is_langfuse_enabled
 from app.retriever import (
     get_vectorstore, load_file, split_documents, compare_chunk_strategies,
     ingest_file,
@@ -25,8 +26,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="RAG Demo - LangGraph", version="0.6.0", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app = FastAPI(title="RAG Demo - LangGraph", version="0.7.0-langfuse", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -36,6 +36,8 @@ class QueryRequest(BaseModel):
     query_transform: Literal["none", "rewrite", "hyde"] = "none"
     use_reranker: bool = False
     top_k: int = 5
+    session_id: str | None = None
+    user_id: str | None = None
 
 
 @app.post("/upload")
@@ -73,20 +75,22 @@ async def smart_upload_document(file: UploadFile = File(...)):
 
 @app.post("/query")
 async def query(req: QueryRequest):
-    """LangGraph RAG 查询（返回结果含 graph_steps 执行轨迹）"""
+    """LangGraph RAG 查询（返回结果含 graph_steps 执行轨迹，Langfuse 全链路追踪）"""
     result = query_rag(
         question=req.question,
         retrieval_mode=req.retrieval_mode,
         query_transform=req.query_transform,
         use_reranker=req.use_reranker,
         top_k=req.top_k,
+        session_id=req.session_id,
+        user_id=req.user_id,
     )
     return result
 
 
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest):
-    """LangGraph RAG 流式查询（SSE），逐 token 输出生成结果"""
+    """LangGraph RAG 流式查询（SSE），逐 token 输出生成结果，Langfuse 追踪"""
     return StreamingResponse(
         query_rag_stream(
             question=req.question,
@@ -94,6 +98,8 @@ async def query_stream(req: QueryRequest):
             query_transform=req.query_transform,
             use_reranker=req.use_reranker,
             top_k=req.top_k,
+            session_id=req.session_id,
+            user_id=req.user_id,
         ),
         media_type="text/event-stream",
     )
@@ -216,9 +222,12 @@ async def health():
     except Exception as e:
         checks["chroma"] = f"error: {e}"
 
+    # Langfuse
+    checks["langfuse"] = "ok (enabled)" if _is_langfuse_enabled() else "disabled (no keys configured)"
+
     all_ok = all(v.startswith("ok") for v in checks.values())
     return {
         "status": "ok" if all_ok else "degraded",
-        "version": "0.6.0-langgraph",
+        "version": "0.7.0-langfuse",
         "services": checks,
     }

@@ -1,10 +1,12 @@
 # RAG 查询图 — LangGraph 版
 # 将 RAG 查询流程建模为显式状态图：
 #   query变换 → 检索 → 文档评估 → (重排序) → 生成 → 幻觉检测 → 输出/重试
+# Langfuse 全链路追踪：一次查询 = 一条 Trace，每个 LLM 节点 = 一个 Generation
 
 import re
 import logging
-from typing import Literal, TypedDict
+import uuid
+from typing import Any, Literal, TypedDict
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -39,6 +41,18 @@ class RAGState(TypedDict):
     retry_count: int
     sources: list
     steps: list
+    # Langfuse 追踪：handler 在图中传递，所有节点共享同一条 trace
+    langfuse_handler: Any
+
+
+# ================================================================
+# 辅助函数
+# ================================================================
+
+def _get_callbacks(state: RAGState) -> list:
+    """从 state 中提取 langfuse handler 作为 callbacks 列表"""
+    handler = state.get("langfuse_handler")
+    return [handler] if handler else []
 
 
 # ================================================================
@@ -50,13 +64,16 @@ def transform_query(state: RAGState) -> dict:
     question = state["question"]
     mode = state.get("query_transform", "none")
     llm = get_llm()
+    callbacks = _get_callbacks(state)
 
     if mode == "rewrite":
         prompt = ChatPromptTemplate.from_template(
             "你是一个搜索查询优化助手。请将用户的问题改写为更适合在知识库中检索的查询语句。"
             "只输出改写后的查询，不要解释。\n\n用户问题：{question}"
         )
-        search_query = (prompt | llm | StrOutputParser()).invoke({"question": question})
+        search_query = (prompt | llm | StrOutputParser()).invoke(
+            {"question": question}, config={"callbacks": callbacks}
+        )
         return {"search_query": search_query, "steps": state.get("steps", []) + [f"query_rewrite → {search_query}"]}
 
     elif mode == "hyde":
@@ -64,7 +81,9 @@ def transform_query(state: RAGState) -> dict:
             "请针对以下问题写一段简短的回答（约100字），即使你不确定也请尝试回答。"
             "这段回答将用于检索相关文档。\n\n问题：{question}"
         )
-        search_query = (prompt | llm | StrOutputParser()).invoke({"question": question})
+        search_query = (prompt | llm | StrOutputParser()).invoke(
+            {"question": question}, config={"callbacks": callbacks}
+        )
         return {"search_query": search_query, "steps": state.get("steps", []) + [f"hyde → {search_query[:80]}..."]}
 
     else:
@@ -134,6 +153,7 @@ def grade_documents(state: RAGState) -> dict:
         }
 
     llm = get_llm()
+    callbacks = _get_callbacks(state)
 
     doc_list = "\n\n".join(
         f"[文档{i}]\n{doc.page_content}" for i, doc in enumerate(docs)
@@ -146,7 +166,10 @@ def grade_documents(state: RAGState) -> dict:
         "文档列表：\n{documents}"
     )
     chain = grade_prompt | llm | StrOutputParser()
-    raw_result = chain.invoke({"question": question, "documents": doc_list}).strip()
+    raw_result = chain.invoke(
+        {"question": question, "documents": doc_list},
+        config={"callbacks": callbacks},
+    ).strip()
 
     grade_results = _parse_grade_result(raw_result, len(docs))
     relevant = [doc for doc, is_relevant in zip(docs, grade_results) if is_relevant]
@@ -179,8 +202,7 @@ def generate(state: RAGState) -> dict:
     question = state["question"]
     docs = state["relevant_docs"]
     llm = get_llm()
-    langfuse_handler = get_langfuse_handler()
-    callbacks = [langfuse_handler] if langfuse_handler else []
+    callbacks = _get_callbacks(state)
 
     context_parts = []
     for doc in docs:
@@ -211,6 +233,7 @@ def check_hallucination(state: RAGState) -> dict:
     answer = state["answer"]
     docs = state["relevant_docs"]
     llm = get_llm()
+    callbacks = _get_callbacks(state)
 
     doc_contents = "\n\n".join([doc.page_content for doc in docs])
 
@@ -221,7 +244,10 @@ def check_hallucination(state: RAGState) -> dict:
         "回答：\n{answer}"
     )
     chain = prompt | llm | StrOutputParser()
-    result = chain.invoke({"documents": doc_contents, "answer": answer}).strip().lower()
+    result = chain.invoke(
+        {"documents": doc_contents, "answer": answer},
+        config={"callbacks": callbacks},
+    ).strip().lower()
 
     passed = result.startswith("yes")
     retry_count = state.get("retry_count", 0)
@@ -370,8 +396,23 @@ def query_rag(
     query_transform: Literal["none", "rewrite", "hyde"] = "none",
     use_reranker: bool = False,
     top_k: int = TOP_K,
+    session_id: str | None = None,
+    user_id: str | None = None,
 ) -> dict:
-    """LangGraph 版 RAG 查询入口"""
+    """LangGraph 版 RAG 查询入口，带 Langfuse 全链路追踪"""
+    # 创建本次查询的 Langfuse handler（共享同一条 trace）
+    langfuse_handler = get_langfuse_handler(
+        trace_name="rag-query",
+        session_id=session_id,
+        user_id=user_id,
+        metadata={
+            "retrieval_mode": retrieval_mode,
+            "query_transform": query_transform,
+            "use_reranker": use_reranker,
+            "top_k": top_k,
+        },
+    )
+
     initial_state: RAGState = {
         "question": question,
         "search_query": "",
@@ -386,6 +427,7 @@ def query_rag(
         "retry_count": 0,
         "sources": [],
         "steps": [],
+        "langfuse_handler": langfuse_handler,
     }
 
     final_state = rag_graph.invoke(initial_state)
@@ -409,12 +451,28 @@ async def query_rag_stream(
     query_transform: Literal["none", "rewrite", "hyde"] = "none",
     use_reranker: bool = False,
     top_k: int = TOP_K,
+    session_id: str | None = None,
+    user_id: str | None = None,
 ):
     """
     LangGraph 版 RAG 流式查询入口。
     使用专用的 stream_rag_graph（无幻觉检测），避免已输出 token 被重试覆盖。
     """
     import json as _json_stream
+
+    # 创建本次流式查询的 Langfuse handler
+    langfuse_handler = get_langfuse_handler(
+        trace_name="rag-query-stream",
+        session_id=session_id,
+        user_id=user_id,
+        metadata={
+            "retrieval_mode": retrieval_mode,
+            "query_transform": query_transform,
+            "use_reranker": use_reranker,
+            "top_k": top_k,
+            "stream": True,
+        },
+    )
 
     initial_state: RAGState = {
         "question": question,
@@ -430,6 +488,7 @@ async def query_rag_stream(
         "retry_count": 0,
         "sources": [],
         "steps": [],
+        "langfuse_handler": langfuse_handler,
     }
 
     async for event in stream_rag_graph.astream_events(initial_state, version="v2"):

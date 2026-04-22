@@ -1414,6 +1414,10 @@ class TestLLMModule:
                 secret_key="sk-test",
                 public_key="pk-test",
                 host="http://localhost:3000",
+                trace_name="rag-query",
+                session_id=None,
+                user_id=None,
+                metadata={},
             )
 
 
@@ -1434,7 +1438,8 @@ class TestFastAPIEndpoints:
         """健康检查 — 所有服务正常"""
         with patch("app.main.get_llm") as mock_llm_fn, \
              patch("app.main.get_embeddings") as mock_emb_fn, \
-             patch("app.main.get_vectorstore") as mock_vs_fn:
+             patch("app.main.get_vectorstore") as mock_vs_fn, \
+             patch("app.main._is_langfuse_enabled", return_value=True):
 
             mock_llm = MagicMock()
             mock_llm.invoke.return_value = MagicMock(content="ok")
@@ -1453,6 +1458,7 @@ class TestFastAPIEndpoints:
             data = resp.json()
             assert data["status"] == "ok"
             assert "42" in data["services"]["chroma"]
+            assert "langfuse" in data["services"]
 
     def test_health_degraded(self):
         """健康检查 — 部分服务异常"""
@@ -1509,6 +1515,8 @@ class TestFastAPIEndpoints:
             query_transform="rewrite",
             use_reranker=True,
             top_k=10,
+            session_id=None,
+            user_id=None,
         )
 
     @patch("app.main.ingest_file")
